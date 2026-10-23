@@ -6,10 +6,10 @@ Each agent type carries its own prop: Explore a magnifier, Plan a hard hat, gene
 
 ## Install
 
-It ships through the `toptaab-mods` marketplace, which lives in [Toptaab/token-garden](https://github.com/Toptaab/token-garden):
+It ships through the `toptaab-mods` marketplace, which lives in [Toptaab/toptaab-mods](https://github.com/Toptaab/toptaab-mods):
 
 ```
-/plugin marketplace add Toptaab/token-garden
+/plugin marketplace add Toptaab/toptaab-mods
 /plugin install agent-roster@toptaab-mods
 /reload-plugins
 ```
@@ -17,11 +17,11 @@ It ships through the `toptaab-mods` marketplace, which lives in [Toptaab/token-g
 From a shell:
 
 ```
-claude plugin marketplace add Toptaab/token-garden
+claude plugin marketplace add Toptaab/toptaab-mods
 claude plugin install agent-roster@toptaab-mods
 ```
 
-In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `Toptaab/token-garden`, then Add plugin.
+In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `Toptaab/toptaab-mods`, then Add plugin.
 
 ## Use
 
