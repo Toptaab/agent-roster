@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register, Timer } from 'claude-code'
 
-import type { AgentCard, Mood, Tokens } from '../types'
+import type { AgentCard, Drawer, Mood, Tokens } from '../types'
 import { SPRITE_COLUMNS, SPRITE_ROWS, hexOf, pixels, rasterCells, svgSource, tintOf } from './sprite'
 
 const PANE = 'agent-roster'
@@ -12,10 +12,13 @@ const agents = atom({ plugin: 'agent-roster', key: 'agents' } as const, {})
 const sessionId = atom({ plugin: 'agent-roster', key: 'sessionId' } as const, '')
 const frame = atom({ plugin: 'agent-roster', key: 'frame' } as const, 0)
 const historyOpen = atom({ plugin: 'agent-roster', key: 'historyOpen' } as const, false)
+const drawer = atom({ plugin: 'agent-roster', key: 'drawer' } as const, 'auto' as Drawer)
 
 // The sprite's beat while anyone works, and how many beats between syncs with $.agent.list().
 const TICK_MS = 400
 const SYNC_EVERY = 5
+// How long the pane lingers once the last subagent is done, so its ✓ is seen.
+const CLOSE_AFTER_MS = 3000
 // Below this the pane has no room for a sprite beside the words.
 const SPRITE_MIN_COLUMNS = 40
 
@@ -131,6 +134,46 @@ const sync = async ($: EngineInterface) => {
   })
 }
 
+const isSubagentAtWork = (all: Record<string, AgentCard>) =>
+  Object.values(all).some(card => card.id !== MAIN && card.mood === 'working')
+
+// Still under way, though maybe paused on a permission prompt: a hide holds through it.
+const isSubagentUnderWay = (all: Record<string, AgentCard>) =>
+  Object.values(all).some(card => card.id !== MAIN && (card.mood === 'working' || card.mood === 'waiting'))
+
+const isPaneUp = async ($: EngineInterface) => (await $.ui.panes()).some(pane => pane.id === PANE)
+
+let quietSince: number | undefined
+let isReconciling = false
+
+// Opens or closes the pane to match the drawer and whether a subagent works.
+const reconcile = async ($: EngineInterface) => {
+  if (isReconciling) {
+    return
+  }
+
+  isReconciling = true
+
+  try {
+    const [all, mode, isUp, now] = await Promise.all([read($, agents), read($, drawer), isPaneUp($), $.clock.now()])
+    const isBusy = isSubagentAtWork(all)
+    quietSince = isBusy ? undefined : (quietSince ?? now)
+
+    if (mode === 'hidden' && !isSubagentUnderWay(all)) {
+      await update($, drawer, () => 'auto' as Drawer)
+    }
+
+    if (!isUp && (mode === 'pinned' || (mode === 'auto' && isBusy))) {
+      await ensureMain($)
+      await $.ui.open({ id: PANE, title: TITLE })
+    } else if (isUp && mode === 'auto' && !isBusy && now - (quietSince ?? now) >= CLOSE_AFTER_MS) {
+      await $.ui.close({ id: PANE })
+    }
+  } finally {
+    isReconciling = false
+  }
+}
+
 const startTicker = ($: EngineInterface) => {
   ticker?.cancel()
   let beats = 0
@@ -146,8 +189,33 @@ const startTicker = ($: EngineInterface) => {
       if (++beats % SYNC_EVERY === 0 && Object.keys(all).length > 1) {
         await sync($)
       }
+
+      await reconcile($)
     })().catch(() => {})
   })
+}
+
+// A close by hand: shut until the next spawn while one works, else back to auto.
+const hide = async ($: EngineInterface) => {
+  const isBusy = isSubagentUnderWay(await read($, agents))
+  await update($, drawer, () => (isBusy ? 'hidden' : 'auto') as Drawer)
+}
+
+// The person's toggle, from /roster or the pane's own button.
+const toggle = async ($: EngineInterface) => {
+  if (await isPaneUp($)) {
+    await hide($)
+    await $.ui.close({ id: PANE })
+
+    return 'Agents pane closed.'
+  }
+
+  const isBusy = isSubagentAtWork(await read($, agents))
+  await update($, drawer, () => (isBusy ? 'auto' : 'pinned') as Drawer)
+  await ensureMain($)
+  await $.ui.open({ id: PANE, title: TITLE })
+
+  return 'Agents pane opened.'
 }
 
 export const register: Register = on => {
@@ -155,13 +223,21 @@ export const register: Register = on => {
     const started = await next(e)
     await $.command.register({
       name: 'roster',
-      description: 'Show every agent of this session as a pixel Claude, with its tokens (args: clear)',
+      description: 'Open or close the agents pane; it opens by itself while subagents work (args: clear)',
     })
     await ensureMain($)
     startTicker($)
-    void $.ui.open({ id: PANE, title: TITLE })
 
     return started
+  })
+
+  // The pane's close mark or Escape: the person's, so the drawer remembers it.
+  on('ui.close', async ($, e, next) => {
+    if (e.id === PANE && e.origin.kind === 'person') {
+      await hide($)
+    }
+
+    return next(e)
   })
 
   on('session.end', async ($, e, next) => {
@@ -180,10 +256,7 @@ export const register: Register = on => {
       return { text: 'Cleared finished agents.' }
     }
 
-    await ensureMain($)
-    await $.ui.open({ id: PANE, title: TITLE })
-
-    return { text: 'Agents pane opened.' }
+    return { text: await toggle($) }
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -203,6 +276,9 @@ export const register: Register = on => {
           startedAt: now,
         }),
       }))
+      // A new spawn ends a close by hand: the pane comes back for it.
+      await update($, drawer, mode => (mode === 'hidden' ? 'auto' : mode))
+      await reconcile($)
     }
 
     return spawned
@@ -307,9 +383,12 @@ export const register: Register = on => {
 
       return (
         <Box flexDirection="column" gap={1}>
-          <Text dimColor>
-            session {session.slice(0, 8)} · {summary}
-          </Text>
+          <Box flexDirection="row" justifyContent="space-between">
+            <Text dimColor>
+              session {session.slice(0, 8)} · {summary}
+            </Text>
+            <Button key="hide" plain dimColor label="Hide" onPress={() => toggle($)} />
+          </Box>
           {live.map(card => {
             const badge = BADGE[card.mood]
             const tint = tintOf(card.type)
@@ -378,7 +457,10 @@ export const register: Register = on => {
 
       return (
         <Box flexDirection="column" gap={1}>
-          <Text dimColor>{fit(`session ${session.slice(0, 8)} · ${summary}`)}</Text>
+          <Box flexDirection="row" gap={1}>
+            <Button key="hide" plain dimColor label="✕ hide" onPress={() => toggle($)} />
+            <Text dimColor>{fit(`session ${session.slice(0, 8)} · ${summary}`)}</Text>
+          </Box>
           {live.map(card => {
             const badge = BADGE[card.mood]
             const tint = tintOf(card.type)

@@ -25,7 +25,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 ## Use
 
-The pane opens at the start of a session where there is room for it. `/roster` opens it by hand; `/roster clear` drops the finished agents from the history.
+The pane opens by itself when a subagent starts and closes a few seconds after the last one is done. `/roster` (or the pane's hide button) toggles it by hand: opened with no agents at work it stays open; closed while agents work it stays shut until the next spawn. `/roster clear` drops the finished agents from the history.
 
 ## Develop
 
