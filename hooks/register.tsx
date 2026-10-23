@@ -1,0 +1,456 @@
+import { atom, read, update } from 'claude-code'
+import type { AgentInfo, EngineInterface, Register, Timer } from 'claude-code'
+
+import type { AgentCard, Mood, Tokens } from '../types'
+import { SPRITE_COLUMNS, SPRITE_ROWS, hexOf, pixels, rasterCells, svgSource, tintOf } from './sprite'
+
+const PANE = 'agent-roster'
+const TITLE = 'Agents'
+const MAIN = 'main'
+
+const agents = atom({ plugin: 'agent-roster', key: 'agents' } as const, {})
+const sessionId = atom({ plugin: 'agent-roster', key: 'sessionId' } as const, '')
+const frame = atom({ plugin: 'agent-roster', key: 'frame' } as const, 0)
+const historyOpen = atom({ plugin: 'agent-roster', key: 'historyOpen' } as const, false)
+
+// The sprite's beat while anyone works, and how many beats between syncs with $.agent.list().
+const TICK_MS = 400
+const SYNC_EVERY = 5
+// Below this the pane has no room for a sprite beside the words.
+const SPRITE_MIN_COLUMNS = 40
+
+const NO_TOKENS: Tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+
+const MOOD_OF: Record<AgentInfo['status'], Mood> = {
+  pending: 'working',
+  running: 'working',
+  waiting: 'waiting',
+  idle: 'waiting',
+  completed: 'done',
+  failed: 'failed',
+  killed: 'failed',
+}
+
+const BADGE: Record<Mood, { glyph: string; word: string; color: string }> = {
+  working: { glyph: '●', word: 'working', color: 'green' },
+  waiting: { glyph: '◌', word: 'waiting', color: 'yellow' },
+  idle: { glyph: '○', word: 'idle', color: 'gray' },
+  done: { glyph: '✓', word: 'done', color: 'cyan' },
+  failed: { glyph: '✗', word: 'failed', color: 'red' },
+}
+
+const shortModel = (model: string) => model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
+
+const compact = (tokens: number) => {
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+  }
+
+  if (tokens >= 1000) {
+    return `${(tokens / 1000).toFixed(1).replace(/\.0$/, '')}k`
+  }
+
+  return String(tokens)
+}
+
+const elapsed = (ms: number) => {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  const minutes = Math.floor(seconds / 60)
+
+  return minutes >= 60
+    ? `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`
+    : `${minutes}:${String(seconds % 60).padStart(2, '0')}`
+}
+
+const totalOf = (tokens: Tokens) => tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite
+
+// Done and failed agents leave the live list for the folded history below it.
+const isOver = (card: AgentCard) => card.id !== MAIN && (card.mood === 'done' || card.mood === 'failed')
+
+// What a tool call is doing, in a few words: the tool and its most telling argument.
+const activityOf = (tool: string, input: Record<string, unknown>) => {
+  const hint = ['description', 'pattern', 'command', 'file_path', 'path', 'url', 'query', 'prompt']
+    .map(key => input[key])
+    .find((value): value is string => typeof value === 'string' && value.length > 0)
+  const name = tool.startsWith('mcp__') ? (tool.split('__').pop() ?? tool) : tool
+
+  return hint ? `${name} ${hint.replace(/\s+/g, ' ').slice(0, 48)}` : name
+}
+
+const cardOf = (id: string, fields: Partial<AgentCard> & Pick<AgentCard, 'type' | 'model' | 'startedAt'>): AgentCard => ({
+  id,
+  description: '',
+  mood: 'working',
+  steps: 0,
+  tokens: NO_TOKENS,
+  ...fields,
+})
+
+const patch = ($: EngineInterface, id: string, fn: (card: AgentCard) => AgentCard) =>
+  update($, agents, all => (all[id] ? { ...all, [id]: fn(all[id]) } : all))
+
+let ticker: Timer | undefined
+
+// The main loop's card, made at the start and again after a reload or a /clear.
+const ensureMain = async ($: EngineInterface) => {
+  const [model, now, id] = await Promise.all([$.session.model(), $.clock.now(), $.session.id()])
+  await update($, sessionId, () => id)
+  await update($, agents, all =>
+    all[MAIN] ? all : { ...all, [MAIN]: cardOf(MAIN, { type: 'main', model, startedAt: now, mood: 'idle' }) },
+  )
+}
+
+// Statuses the events do not say (a teammate gone idle, a killed task), and agents spawned
+// before this load, from the engine's own list.
+const sync = async ($: EngineInterface) => {
+  const [listed, now] = await Promise.all([$.agent.list(), $.clock.now()])
+  await update($, agents, all => {
+    const next = { ...all }
+
+    for (const info of listed) {
+      const mood = MOOD_OF[info.status]
+      const known = next[info.id]
+
+      if (!known) {
+        next[info.id] = cardOf(info.id, {
+          type: info.type,
+          description: info.description,
+          name: info.name,
+          parentId: info.parentId,
+          model: '',
+          startedAt: now,
+          mood,
+        })
+      } else if (known.mood !== mood && !(known.mood === 'done' && mood === 'working')) {
+        const isOver = mood === 'done' || mood === 'failed'
+        next[info.id] = { ...known, mood, endedAt: isOver ? (known.endedAt ?? now) : undefined }
+      }
+    }
+
+    return next
+  })
+}
+
+const startTicker = ($: EngineInterface) => {
+  ticker?.cancel()
+  let beats = 0
+  ticker = $.clock.every(TICK_MS, () => {
+    void (async () => {
+      const all = await read($, agents)
+      const isBusy = Object.values(all).some(card => card.mood === 'working' || card.mood === 'waiting')
+
+      if (isBusy) {
+        await update($, frame, n => (n + 1) % 1024)
+      }
+
+      if (++beats % SYNC_EVERY === 0 && Object.keys(all).length > 1) {
+        await sync($)
+      }
+    })().catch(() => {})
+  })
+}
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    await $.command.register({
+      name: 'roster',
+      description: 'Show every agent of this session as a pixel Claude, with its tokens (args: clear)',
+    })
+    await ensureMain($)
+    startTicker($)
+    void $.ui.open({ id: PANE, title: TITLE })
+
+    return started
+  })
+
+  on('session.end', async ($, e, next) => {
+    ticker?.cancel()
+    ticker = undefined
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'roster' }, async ($, e) => {
+    if (e.args.trim() === 'clear') {
+      await update($, agents, all =>
+        Object.fromEntries(Object.entries(all).filter(([, card]) => card.mood !== 'done' && card.mood !== 'failed')),
+      )
+
+      return { text: 'Cleared finished agents.' }
+    }
+
+    await ensureMain($)
+    await $.ui.open({ id: PANE, title: TITLE })
+
+    return { text: 'Agents pane opened.' }
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const spawned = await next(e)
+
+    if (spawned.agentId) {
+      const id = spawned.agentId
+      const now = await $.clock.now()
+      await update($, agents, all => ({
+        ...all,
+        [id]: cardOf(id, {
+          type: e.subagentType,
+          description: e.description,
+          name: e.name,
+          parentId: e.parentAgentId,
+          model: spawned.model,
+          startedAt: now,
+        }),
+      }))
+    }
+
+    return spawned
+  })
+
+  on('turn.start', async ($, e, next) => {
+    const id = e.agentId ?? MAIN
+
+    if (id === MAIN) {
+      await ensureMain($)
+    }
+
+    await patch($, id, card => ({ ...card, mood: 'working', endedAt: undefined }))
+
+    return next(e)
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    const response = yield* next(e)
+    const usage = response.usage
+
+    if (usage) {
+      await patch($, e.agentId ?? MAIN, card => ({
+        ...card,
+        model: card.model || usage.model,
+        steps: card.steps + 1,
+        tokens: {
+          input: card.tokens.input + usage.input_tokens,
+          output: card.tokens.output + usage.output_tokens,
+          cacheRead: card.tokens.cacheRead + usage.cache_read_input_tokens,
+          cacheWrite: card.tokens.cacheWrite + usage.cache_creation_input_tokens,
+        },
+        contextTokens:
+          card.id === MAIN
+            ? usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
+            : undefined,
+      }))
+    }
+
+    return response
+  })
+
+  on('tool.call', async ($, e, next) => {
+    const id = e.agentId ?? MAIN
+    const toolUseId = e.tool_use_id ?? ''
+    await patch($, id, card => ({
+      ...card,
+      activity: { toolUseId, label: activityOf(e.tool, e as unknown as Record<string, unknown>) },
+    }))
+
+    try {
+      return await next(e)
+    } finally {
+      await patch($, id, card => (card.activity?.toolUseId === toolUseId ? { ...card, activity: undefined } : card))
+    }
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const id = e.agentId ?? MAIN
+    const now = await $.clock.now()
+    const mood: Mood =
+      id === MAIN ? 'idle' : e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? 'waiting' : 'failed'
+    await patch($, id, card => ({ ...card, mood, activity: undefined, endedAt: id === MAIN ? undefined : now }))
+
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const all = await read($, agents)
+    const session = await read($, sessionId)
+    const now = await $.clock.now()
+    const cards = Object.values(all).sort((a, b) =>
+      a.id === MAIN ? -1 : b.id === MAIN ? 1 : a.startedAt - b.startedAt,
+    )
+    const subagents = cards.filter(card => card.id !== MAIN)
+    const subTotal = subagents.reduce((sum, card) => sum + totalOf(card.tokens), 0)
+    const allTotal = cards.reduce((sum, card) => sum + totalOf(card.tokens), 0)
+    const working = cards.filter(card => card.mood === 'working').length
+
+    const nameOf = (card: AgentCard) => (card.id === MAIN ? 'main' : (card.name ?? card.type))
+    const clockOf = (card: AgentCard) => elapsed((card.endedAt ?? now) - card.startedAt)
+    const tokenLine = (card: AgentCard) =>
+      `↑${compact(card.tokens.input + card.tokens.cacheRead + card.tokens.cacheWrite)} ↓${compact(card.tokens.output)}` +
+      ` · ${card.steps} step${card.steps === 1 ? '' : 's'}`
+    const detailOf = (card: AgentCard) =>
+      card.activity ? `▶ ${card.activity.label}` : card.description ? `“${card.description}”` : ''
+    const summary =
+      `${working} working · ${subagents.length} agent${subagents.length === 1 ? '' : 's'}` +
+      ` · Σ ${compact(subTotal)} sub / ${compact(allTotal)} all`
+
+    const live = cards.filter(card => !isOver(card))
+    const history = cards.filter(isOver).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
+    const isHistoryOpen = await read($, historyOpen)
+    const toggleHistory = () => update($, historyOpen, open => !open)
+    const historyLabel = `${isHistoryOpen ? '▾' : '▸'} history (${history.length})`
+    const historyLine = (card: AgentCard) =>
+      `${BADGE[card.mood].glyph} ${nameOf(card)} · ${compact(totalOf(card.tokens))} · ${clockOf(card)}` +
+      (card.description ? ` · ${card.description}` : '')
+
+    if (e.surface === 'desktop') {
+      const { Box, Text, Button, Svg } = $.ui.resolve(e)
+
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text dimColor>
+            session {session.slice(0, 8)} · {summary}
+          </Text>
+          {live.map(card => {
+            const badge = BADGE[card.mood]
+            const tint = tintOf(card.type)
+
+            return (
+              <Box key={card.id} flexDirection="row" gap={2} padding={1} borderStyle="round" borderColor={hexOf(tint)}>
+                <Svg
+                  source={svgSource(card.mood, card.type)}
+                  alt={`Claude, ${nameOf(card)}, ${badge.word}`}
+                  width={96}
+                  height={64}
+                  isInteractive
+                />
+                <Box flexDirection="column" flexGrow={1}>
+                  <Text>
+                    <Text bold>{nameOf(card)}</Text>
+                    <Text dimColor>
+                      {' '}
+                      {card.type !== nameOf(card) ? `${card.type} · ` : ''}
+                      {shortModel(card.model)}
+                    </Text>
+                  </Text>
+                  <Text>
+                    <Text color={badge.color}>
+                      {badge.glyph} {badge.word}
+                    </Text>
+                    <Text dimColor> · {clockOf(card)}</Text>
+                  </Text>
+                  <Text>
+                    {tokenLine(card)}
+                    {card.contextTokens ? ` · ctx ${compact(card.contextTokens)}` : ''}
+                  </Text>
+                  {detailOf(card) && <Text dimColor>{detailOf(card)}</Text>}
+                  {card.id !== MAIN && (
+                    <Button key={`view-${card.id}`} label="Open transcript" onPress={() => $.ui.view({ agentId: card.id })} />
+                  )}
+                </Box>
+              </Box>
+            )
+          })}
+          {history.length > 0 && (
+            <Box flexDirection="column">
+              <Button key="history" plain dimColor label={historyLabel} onPress={toggleHistory} />
+              {isHistoryOpen &&
+                history.map(card => (
+                  <Button
+                    key={`past-${card.id}`}
+                    plain
+                    dimColor
+                    label={historyLine(card)}
+                    onPress={() => $.ui.view({ agentId: card.id })}
+                  />
+                ))}
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    if (e.surface === 'terminal') {
+      const { Box, Text, Button, Raster } = $.ui.resolve(e)
+      const beat = await read($, frame)
+      const hasRoom = e.props.bodyColumns >= SPRITE_MIN_COLUMNS
+      const textColumns = Math.max(10, e.props.bodyColumns - (hasRoom ? SPRITE_COLUMNS + 1 : 0))
+      const fit = (text: string) => (text.length > textColumns ? `${text.slice(0, textColumns - 1)}…` : text)
+
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text dimColor>{fit(`session ${session.slice(0, 8)} · ${summary}`)}</Text>
+          {live.map(card => {
+            const badge = BADGE[card.mood]
+            const tint = tintOf(card.type)
+
+            return (
+              <Box key={card.id} flexDirection="row" gap={1}>
+                {hasRoom && (
+                  <Raster
+                    key={`sprite-${card.id}`}
+                    columns={SPRITE_COLUMNS}
+                    rows={SPRITE_ROWS}
+                    cells={rasterCells(pixels(card.mood, beat, card.type))}
+                  />
+                )}
+                <Box flexDirection="column">
+                  <Text>
+                    <Text bold color={hexOf(tint)}>
+                      {nameOf(card)}
+                    </Text>
+                    <Text dimColor> {fit(shortModel(card.model))}</Text>
+                  </Text>
+                  <Text>
+                    <Text color={badge.color}>
+                      {badge.glyph} {badge.word}
+                    </Text>
+                    <Text dimColor> {clockOf(card)}</Text>
+                  </Text>
+                  <Text>
+                    {fit(tokenLine(card) + (card.contextTokens ? ` · ctx ${compact(card.contextTokens)}` : ''))}
+                  </Text>
+                  <Text dimColor>{fit(detailOf(card))}</Text>
+                  {card.id !== MAIN ? (
+                    <Button key={`view-${card.id}`} plain dimColor label="↗ transcript" onPress={() => $.ui.view({ agentId: card.id })} />
+                  ) : (
+                    <Text> </Text>
+                  )}
+                </Box>
+              </Box>
+            )
+          })}
+          {history.length > 0 && (
+            <Box flexDirection="column">
+              <Button key="history" plain dimColor label={historyLabel} onPress={toggleHistory} />
+              {isHistoryOpen &&
+                history.map(card => (
+                  <Button
+                    key={`past-${card.id}`}
+                    plain
+                    dimColor
+                    label={fit(historyLine(card))}
+                    onPress={() => $.ui.view({ agentId: card.id })}
+                  />
+                ))}
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    // vscode and mobile: words alone.
+    const { Box, Text } = $.ui.resolve(e)
+
+    return (
+      <Box flexDirection="column">
+        <Text dimColor>{summary}</Text>
+        {live.map(card => (
+          <Text key={card.id}>
+            {BADGE[card.mood].glyph} {nameOf(card)} · {tokenLine(card)} · {clockOf(card)}
+          </Text>
+        ))}
+        {history.length > 0 && <Text dimColor>history ({history.length})</Text>}
+      </Box>
+    )
+  })
+}

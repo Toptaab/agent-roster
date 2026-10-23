@@ -1,0 +1,7 @@
+{
+  "name": "agent-roster",
+  "version": "0.1.0",
+  "description": "A live pane of every agent in the session, each a pixel Claude at work, with its tokens and status.",
+  "author": { "name": "Toptaab" },
+  "types": "./types/index.d.ts"
+}
