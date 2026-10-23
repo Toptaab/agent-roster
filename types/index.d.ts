@@ -36,6 +36,10 @@ declare module 'claude-code' {
       // Whether the finished agents' history is unfolded.
       historyOpen: boolean
       drawer: Drawer
+      // Whether the terminal's band shows the roster (the terminal draws no pane).
+      bandShown: boolean
+      // Which row of cards the band shows when they wrap past one.
+      cardRow: number
     }
   }
 }

@@ -27,6 +27,8 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 The pane opens by itself when a subagent starts and closes a few seconds after the last one is done. `/roster` (or the pane's hide button) toggles it by hand: opened with no agents at work it stays open; closed while agents work it stays shut until the next spawn. `/roster clear` drops the finished agents from the history.
 
+In the terminal the roster draws in the band above the prompt rather than a pane docked beside the transcript, full width, so its rows are its own: a transcript line of Thai (whose vowel and tone marks take no cell) cannot shift it. The desktop app keeps the pane. With [token-garden](https://github.com/Toptaab/token-garden) installed the two share the band.
+
 ## Develop
 
 Run Claude Code against the working copy, from the repo root:

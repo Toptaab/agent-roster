@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, Register, Timer } from 'claude-code'
+import type { AgentInfo, ElementTable, EngineInterface, Register, RenderSurface, Timer } from 'claude-code'
 
 import type { AgentCard, Drawer, Mood, Tokens } from '../types'
 import { SPRITE_COLUMNS, SPRITE_ROWS, hexOf, pixels, rasterCells, svgSource, tintOf } from './sprite'
@@ -13,14 +13,20 @@ const sessionId = atom({ plugin: 'agent-roster', key: 'sessionId' } as const, ''
 const frame = atom({ plugin: 'agent-roster', key: 'frame' } as const, 0)
 const historyOpen = atom({ plugin: 'agent-roster', key: 'historyOpen' } as const, false)
 const drawer = atom({ plugin: 'agent-roster', key: 'drawer' } as const, 'auto' as Drawer)
+const bandShown = atom({ plugin: 'agent-roster', key: 'bandShown' } as const, false)
+const cardRow = atom({ plugin: 'agent-roster', key: 'cardRow' } as const, 0)
 
 // The sprite's beat while anyone works, and how many beats between syncs with $.agent.list().
 const TICK_MS = 400
 const SYNC_EVERY = 5
 // How long the pane lingers once the last subagent is done, so its ✓ is seen.
 const CLOSE_AFTER_MS = 3000
-// Below this the pane has no room for a sprite beside the words.
-const SPRITE_MIN_COLUMNS = 40
+// A terminal card's width (Clawd beside his words), the gap between cards in a row, and the
+// least room for the words before Clawd steps out.
+const CARD_COLUMNS = 40
+const CARD_GAP = 2
+const INFO_MIN_COLUMNS = 16
+const HIDE_LABEL = '✕ hide'
 
 const NO_TOKENS: Tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 
@@ -141,7 +147,34 @@ const isSubagentAtWork = (all: Record<string, AgentCard>) =>
 const isSubagentUnderWay = (all: Record<string, AgentCard>) =>
   Object.values(all).some(card => card.id !== MAIN && (card.mood === 'working' || card.mood === 'waiting'))
 
-const isPaneUp = async ($: EngineInterface) => (await $.ui.panes()).some(pane => pane.id === PANE)
+// The terminal draws the roster in the band above the prompt, not a pane: a pane docked
+// beside the transcript shares its rows, and a row of Thai there (its marks take no cell,
+// which the terminal and the engine count apart) shifts the pane's half of the row.
+let surface: RenderSurface | null = null
+// How many rows of cards the band's last drawing wrapped into.
+let cardRows = 0
+const isBand = () => surface === 'terminal'
+
+const isUp = async ($: EngineInterface) =>
+  isBand() ? read($, bandShown) : (await $.ui.panes()).some(pane => pane.id === PANE)
+
+const show = async ($: EngineInterface) => {
+  await ensureMain($)
+
+  if (isBand()) {
+    await update($, bandShown, () => true)
+  } else {
+    await $.ui.open({ id: PANE, title: TITLE })
+  }
+}
+
+const unshow = async ($: EngineInterface) => {
+  if (isBand()) {
+    await update($, bandShown, () => false)
+  } else {
+    await $.ui.close({ id: PANE })
+  }
+}
 
 let quietSince: number | undefined
 let isReconciling = false
@@ -155,7 +188,7 @@ const reconcile = async ($: EngineInterface) => {
   isReconciling = true
 
   try {
-    const [all, mode, isUp, now] = await Promise.all([read($, agents), read($, drawer), isPaneUp($), $.clock.now()])
+    const [all, mode, isShown, now] = await Promise.all([read($, agents), read($, drawer), isUp($), $.clock.now()])
     const isBusy = isSubagentAtWork(all)
     quietSince = isBusy ? undefined : (quietSince ?? now)
 
@@ -163,11 +196,10 @@ const reconcile = async ($: EngineInterface) => {
       await update($, drawer, () => 'auto' as Drawer)
     }
 
-    if (!isUp && (mode === 'pinned' || (mode === 'auto' && isBusy))) {
-      await ensureMain($)
-      await $.ui.open({ id: PANE, title: TITLE })
-    } else if (isUp && mode === 'auto' && !isBusy && now - (quietSince ?? now) >= CLOSE_AFTER_MS) {
-      await $.ui.close({ id: PANE })
+    if (!isShown && (mode === 'pinned' || (mode === 'auto' && isBusy))) {
+      await show($)
+    } else if (isShown && mode === 'auto' && !isBusy && now - (quietSince ?? now) >= CLOSE_AFTER_MS) {
+      await unshow($)
     }
   } finally {
     isReconciling = false
@@ -203,27 +235,152 @@ const hide = async ($: EngineInterface) => {
 
 // The person's toggle, from /roster or the pane's own button.
 const toggle = async ($: EngineInterface) => {
-  if (await isPaneUp($)) {
+  if (await isUp($)) {
     await hide($)
-    await $.ui.close({ id: PANE })
+    await unshow($)
 
-    return 'Agents pane closed.'
+    return 'Agents roster closed.'
   }
 
   const isBusy = isSubagentAtWork(await read($, agents))
   await update($, drawer, () => (isBusy ? 'auto' : 'pinned') as Drawer)
-  await ensureMain($)
-  await $.ui.open({ id: PANE, title: TITLE })
+  await show($)
 
-  return 'Agents pane opened.'
+  return 'Agents roster opened.'
+}
+
+// What every surface draws the roster from.
+const rosterOf = async ($: EngineInterface) => {
+  const all = await read($, agents)
+  const session = await read($, sessionId)
+  const now = await $.clock.now()
+  const cards = Object.values(all).sort((a, b) =>
+    a.id === MAIN ? -1 : b.id === MAIN ? 1 : a.startedAt - b.startedAt,
+  )
+  const subagents = cards.filter(card => card.id !== MAIN)
+  const subTotal = subagents.reduce((sum, card) => sum + totalOf(card.tokens), 0)
+  const allTotal = cards.reduce((sum, card) => sum + totalOf(card.tokens), 0)
+  const working = cards.filter(card => card.mood === 'working').length
+
+  const nameOf = (card: AgentCard) => (card.id === MAIN ? 'main' : (card.name ?? card.type))
+  const clockOf = (card: AgentCard) => elapsed((card.endedAt ?? now) - card.startedAt)
+  const tokenLine = (card: AgentCard) =>
+    `↑${compact(card.tokens.input + card.tokens.cacheRead + card.tokens.cacheWrite)} ↓${compact(card.tokens.output)}` +
+    ` · ${card.steps} step${card.steps === 1 ? '' : 's'}`
+  const detailOf = (card: AgentCard) =>
+    card.activity ? `▶ ${card.activity.label}` : card.description ? `“${card.description}”` : ''
+  const summary =
+    `${working} working · ${subagents.length} agent${subagents.length === 1 ? '' : 's'}` +
+    ` · Σ ${compact(subTotal)} sub / ${compact(allTotal)} all`
+
+  const live = cards.filter(card => !isOver(card))
+  const history = cards.filter(isOver).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
+  const isHistoryOpen = await read($, historyOpen)
+  const toggleHistory = () => update($, historyOpen, open => !open)
+  const historyLabel = `${isHistoryOpen ? '▾' : '▸'} history (${history.length})`
+  const historyLine = (card: AgentCard) =>
+    `${BADGE[card.mood].glyph} ${nameOf(card)} · ${compact(totalOf(card.tokens))} · ${clockOf(card)}` +
+    (card.description ? ` · ${card.description}` : '')
+
+  return { session, summary, live, history, isHistoryOpen, toggleHistory, historyLabel, historyLine, nameOf, clockOf, tokenLine, detailOf }
+}
+
+// The terminal's roster, in quadrant-block sprites: the band above the prompt draws it, and a
+// pane would. `columns` is the room the site gives it.
+const drawTerminal = async ($: EngineInterface, elements: ElementTable<'terminal'>, columns: number) => {
+  const { session, summary, live, history, isHistoryOpen, toggleHistory, historyLabel, historyLine, nameOf, clockOf, tokenLine, detailOf } =
+    await rosterOf($)
+  const { Box, Text, Button, Raster } = elements
+  const beat = await read($, frame)
+  // Cards stand side by side and wrap into rows, of which the band shows one: the wheel moves it.
+  const cardColumns = Math.min(CARD_COLUMNS, columns)
+  const hasRoom = cardColumns - SPRITE_COLUMNS - 1 >= INFO_MIN_COLUMNS
+  const perRow = Math.max(1, Math.floor((columns + CARD_GAP) / (cardColumns + CARD_GAP)))
+  const rows = Array.from({ length: Math.ceil(live.length / perRow) }, (_, i) => live.slice(i * perRow, (i + 1) * perRow))
+  cardRows = rows.length
+  const shown = Math.min(await read($, cardRow), Math.max(0, rows.length - 1))
+  const fitTo = (width: number) => (text: string) => (text.length > width ? `${text.slice(0, width - 1)}…` : text)
+  const fit = fitTo(Math.max(10, cardColumns - (hasRoom ? SPRITE_COLUMNS + 1 : 0)))
+  const fitRow = fitTo(columns)
+  // First in the header, where a narrow band does not cut it.
+  const where = rows.length > 1 ? ` · row ${shown + 1}/${rows.length} ↕` : ''
+  // The header has the row to itself, less the hide button and its gap.
+  const fitHeader = fitTo(Math.max(10, columns - HIDE_LABEL.length - 1))
+
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Box flexDirection="row" gap={1}>
+        <Button key="hide" plain dimColor label={HIDE_LABEL} onPress={() => toggle($)} />
+        <Text dimColor>{fitHeader(`Agents${where} · session ${session.slice(0, 8)} · ${summary}`)}</Text>
+      </Box>
+      <Box flexDirection="row" columnGap={CARD_GAP}>
+        {(rows[shown] ?? []).map(card => {
+          const badge = BADGE[card.mood]
+          const tint = tintOf(card.type)
+
+          return (
+            <Box key={card.id} flexDirection="row" gap={1} width={cardColumns}>
+              {hasRoom && (
+                <Raster
+                  key={`sprite-${card.id}`}
+                  columns={SPRITE_COLUMNS}
+                  rows={SPRITE_ROWS}
+                  cells={rasterCells(pixels(card.mood, beat, card.type))}
+                />
+              )}
+              <Box flexDirection="column">
+                <Text>
+                  <Text bold color={hexOf(tint)}>
+                    {nameOf(card)}
+                  </Text>
+                  <Text dimColor> {fit(shortModel(card.model))}</Text>
+                </Text>
+                <Text>
+                  <Text color={badge.color}>
+                    {badge.glyph} {badge.word}
+                  </Text>
+                  <Text dimColor> {clockOf(card)}</Text>
+                </Text>
+                <Text>
+                  {fit(tokenLine(card) + (card.contextTokens ? ` · ctx ${compact(card.contextTokens)}` : ''))}
+                </Text>
+                <Text dimColor>{fit(detailOf(card))}</Text>
+                {card.id !== MAIN ? (
+                  <Button key={`view-${card.id}`} plain dimColor label="↗ transcript" onPress={() => $.ui.view({ agentId: card.id })} />
+                ) : (
+                  <Text> </Text>
+                )}
+              </Box>
+            </Box>
+          )
+        })}
+      </Box>
+      {history.length > 0 && (
+        <Box flexDirection="column">
+          <Button key="history" plain dimColor label={historyLabel} onPress={toggleHistory} />
+          {isHistoryOpen &&
+            history.map(card => (
+              <Button
+                key={`past-${card.id}`}
+                plain
+                dimColor
+                label={fitRow(historyLine(card))}
+                onPress={() => $.ui.view({ agentId: card.id })}
+              />
+            ))}
+        </Box>
+      )}
+    </Box>
+  )
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    surface = e.surface
     await $.command.register({
       name: 'roster',
-      description: 'Open or close the agents pane; it opens by itself while subagents work (args: clear)',
+      description: 'Open or close the agents roster; it opens by itself while subagents work (args: clear)',
     })
     await ensureMain($)
     startTicker($)
@@ -346,37 +503,38 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const all = await read($, agents)
-    const session = await read($, sessionId)
-    const now = await $.clock.now()
-    const cards = Object.values(all).sort((a, b) =>
-      a.id === MAIN ? -1 : b.id === MAIN ? 1 : a.startedAt - b.startedAt,
+  // The terminal's roster, over whatever else the band holds (token-garden's forecast).
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.surface !== 'terminal' || e.props.hasSurvey || !(await read($, bandShown))) {
+      return next(e)
+    }
+
+    const elements = $.ui.resolve(e)
+    const { Box } = elements
+
+    return (
+      <Box flexDirection="column">
+        {await drawTerminal($, elements, e.props.bodyColumns)}
+        {await next(e)}
+      </Box>
     )
-    const subagents = cards.filter(card => card.id !== MAIN)
-    const subTotal = subagents.reduce((sum, card) => sum + totalOf(card.tokens), 0)
-    const allTotal = cards.reduce((sum, card) => sum + totalOf(card.tokens), 0)
-    const working = cards.filter(card => card.mood === 'working').length
+  })
 
-    const nameOf = (card: AgentCard) => (card.id === MAIN ? 'main' : (card.name ?? card.type))
-    const clockOf = (card: AgentCard) => elapsed((card.endedAt ?? now) - card.startedAt)
-    const tokenLine = (card: AgentCard) =>
-      `↑${compact(card.tokens.input + card.tokens.cacheRead + card.tokens.cacheWrite)} ↓${compact(card.tokens.output)}` +
-      ` · ${card.steps} step${card.steps === 1 ? '' : 's'}`
-    const detailOf = (card: AgentCard) =>
-      card.activity ? `▶ ${card.activity.label}` : card.description ? `“${card.description}”` : ''
-    const summary =
-      `${working} working · ${subagents.length} agent${subagents.length === 1 ? '' : 's'}` +
-      ` · Σ ${compact(subTotal)} sub / ${compact(allTotal)} all`
+  // With cards in more than one row, the wheel over the band steps through them, a row a tick.
+  on('ui.scroll', async ($, e, next) => {
+    if (e.component !== 'AbovePrompt' || !isBand() || cardRows <= 1 || !(await read($, bandShown))) {
+      return next(e)
+    }
 
-    const live = cards.filter(card => !isOver(card))
-    const history = cards.filter(isOver).sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
-    const isHistoryOpen = await read($, historyOpen)
-    const toggleHistory = () => update($, historyOpen, open => !open)
-    const historyLabel = `${isHistoryOpen ? '▾' : '▸'} history (${history.length})`
-    const historyLine = (card: AgentCard) =>
-      `${BADGE[card.mood].glyph} ${nameOf(card)} · ${compact(totalOf(card.tokens))} · ${clockOf(card)}` +
-      (card.description ? ` · ${card.description}` : '')
+    const step = Math.sign(e.by)
+    await update($, cardRow, row => Math.min(cardRows - 1, Math.max(0, row + step)))
+
+    return {}
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { session, summary, live, history, isHistoryOpen, toggleHistory, historyLabel, historyLine, nameOf, clockOf, tokenLine, detailOf } =
+      await rosterOf($)
 
     if (e.surface === 'desktop') {
       const { Box, Text, Button, Svg } = $.ui.resolve(e)
@@ -449,75 +607,7 @@ export const register: Register = on => {
     }
 
     if (e.surface === 'terminal') {
-      const { Box, Text, Button, Raster } = $.ui.resolve(e)
-      const beat = await read($, frame)
-      const hasRoom = e.props.bodyColumns >= SPRITE_MIN_COLUMNS
-      const textColumns = Math.max(10, e.props.bodyColumns - (hasRoom ? SPRITE_COLUMNS + 1 : 0))
-      const fit = (text: string) => (text.length > textColumns ? `${text.slice(0, textColumns - 1)}…` : text)
-
-      return (
-        <Box flexDirection="column" gap={1}>
-          <Box flexDirection="row" gap={1}>
-            <Button key="hide" plain dimColor label="✕ hide" onPress={() => toggle($)} />
-            <Text dimColor>{fit(`session ${session.slice(0, 8)} · ${summary}`)}</Text>
-          </Box>
-          {live.map(card => {
-            const badge = BADGE[card.mood]
-            const tint = tintOf(card.type)
-
-            return (
-              <Box key={card.id} flexDirection="row" gap={1}>
-                {hasRoom && (
-                  <Raster
-                    key={`sprite-${card.id}`}
-                    columns={SPRITE_COLUMNS}
-                    rows={SPRITE_ROWS}
-                    cells={rasterCells(pixels(card.mood, beat, card.type))}
-                  />
-                )}
-                <Box flexDirection="column">
-                  <Text>
-                    <Text bold color={hexOf(tint)}>
-                      {nameOf(card)}
-                    </Text>
-                    <Text dimColor> {fit(shortModel(card.model))}</Text>
-                  </Text>
-                  <Text>
-                    <Text color={badge.color}>
-                      {badge.glyph} {badge.word}
-                    </Text>
-                    <Text dimColor> {clockOf(card)}</Text>
-                  </Text>
-                  <Text>
-                    {fit(tokenLine(card) + (card.contextTokens ? ` · ctx ${compact(card.contextTokens)}` : ''))}
-                  </Text>
-                  <Text dimColor>{fit(detailOf(card))}</Text>
-                  {card.id !== MAIN ? (
-                    <Button key={`view-${card.id}`} plain dimColor label="↗ transcript" onPress={() => $.ui.view({ agentId: card.id })} />
-                  ) : (
-                    <Text> </Text>
-                  )}
-                </Box>
-              </Box>
-            )
-          })}
-          {history.length > 0 && (
-            <Box flexDirection="column">
-              <Button key="history" plain dimColor label={historyLabel} onPress={toggleHistory} />
-              {isHistoryOpen &&
-                history.map(card => (
-                  <Button
-                    key={`past-${card.id}`}
-                    plain
-                    dimColor
-                    label={fit(historyLine(card))}
-                    onPress={() => $.ui.view({ agentId: card.id })}
-                  />
-                ))}
-            </Box>
-          )}
-        </Box>
-      )
+      return drawTerminal($, $.ui.resolve(e), e.props.bodyColumns)
     }
 
     // vscode and mobile: words alone.
