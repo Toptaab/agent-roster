@@ -264,9 +264,13 @@ const rosterOf = async ($: EngineInterface) => {
 
   const nameOf = (card: AgentCard) => (card.id === MAIN ? 'main' : (card.name ?? card.type))
   const clockOf = (card: AgentCard) => elapsed((card.endedAt ?? now) - card.startedAt)
+  // Each card's context window as of its last step, not its billed sum: every step re-sends it.
+  // Main shows its context alone: the session's whole conversation, against the compaction line.
   const tokenLine = (card: AgentCard) =>
-    `↑${compact(card.tokens.input + card.tokens.cacheRead + card.tokens.cacheWrite)} ↓${compact(card.tokens.output)}` +
-    ` · ${card.steps} step${card.steps === 1 ? '' : 's'}`
+    card.id === MAIN
+      ? `ctx ${compact(card.contextTokens ?? 0)}`
+      : `ctx ${compact(card.contextTokens ?? 0)} ↓${compact(card.tokens.output)}` +
+        ` · ${card.steps} step${card.steps === 1 ? '' : 's'}`
   const detailOf = (card: AgentCard) =>
     card.activity ? `▶ ${card.activity.label}` : card.description ? `“${card.description}”` : ''
   const summary =
@@ -279,7 +283,7 @@ const rosterOf = async ($: EngineInterface) => {
   const toggleHistory = () => update($, historyOpen, open => !open)
   const historyLabel = `${isHistoryOpen ? '▾' : '▸'} history (${history.length})`
   const historyLine = (card: AgentCard) =>
-    `${BADGE[card.mood].glyph} ${nameOf(card)} · ${compact(totalOf(card.tokens))} · ${clockOf(card)}` +
+    `${BADGE[card.mood].glyph} ${nameOf(card)} · ctx ${compact(card.contextTokens ?? 0)} · ${clockOf(card)}` +
     (card.description ? ` · ${card.description}` : '')
 
   return { session, summary, live, history, isHistoryOpen, toggleHistory, historyLabel, historyLine, nameOf, clockOf, tokenLine, detailOf }
@@ -342,7 +346,7 @@ const drawTerminal = async ($: EngineInterface, elements: ElementTable<'terminal
                   <Text dimColor> {clockOf(card)}</Text>
                 </Text>
                 <Text>
-                  {fit(tokenLine(card) + (card.contextTokens ? ` · ctx ${compact(card.contextTokens)}` : ''))}
+                  {fit(tokenLine(card))}
                 </Text>
                 <Text dimColor>{fit(detailOf(card))}</Text>
                 {card.id !== MAIN ? (
@@ -469,9 +473,7 @@ export const register: Register = on => {
           cacheWrite: card.tokens.cacheWrite + usage.cache_creation_input_tokens,
         },
         contextTokens:
-          card.id === MAIN
-            ? usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
-            : undefined,
+          usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens + usage.output_tokens,
       }))
     }
 
@@ -577,7 +579,6 @@ export const register: Register = on => {
                   </Text>
                   <Text>
                     {tokenLine(card)}
-                    {card.contextTokens ? ` · ctx ${compact(card.contextTokens)}` : ''}
                   </Text>
                   {detailOf(card) && <Text dimColor>{detailOf(card)}</Text>}
                   {card.id !== MAIN && (

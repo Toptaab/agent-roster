@@ -23,7 +23,7 @@ export type AgentCard = {
   steps: number
   tokens: Tokens
   activity?: Activity
-  // Main only: what the next request re-sends.
+  // What the agent's next request re-sends: its context window as of its last step.
   contextTokens?: number
 }
 
