@@ -1,10 +1,14 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, ElementTable, EngineInterface, Register, RenderSurface, Timer } from 'claude-code'
+import type { AgentInfo, ElementTable, EngineInterface, Register, RenderSurface, SessionMessage, Timer } from 'claude-code'
 
 import type { AgentCard, Drawer, Mood, Tokens } from '../types'
 import { SPRITE_COLUMNS, SPRITE_ROWS, hexOf, pixels, rasterCells, svgSource, tintOf } from './sprite'
 
 const PANE = 'agent-roster'
+// The progress pane: an agent's own conversation, for when the main view will not show it.
+const LOG = 'agent-roster-log'
+// How many of its latest messages the progress pane draws.
+const LOG_MESSAGES = 30
 const TITLE = 'Agents'
 const MAIN = 'main'
 
@@ -15,6 +19,7 @@ const historyOpen = atom({ plugin: 'agent-roster', key: 'historyOpen' } as const
 const drawer = atom({ plugin: 'agent-roster', key: 'drawer' } as const, 'auto' as Drawer)
 const bandShown = atom({ plugin: 'agent-roster', key: 'bandShown' } as const, false)
 const cardRow = atom({ plugin: 'agent-roster', key: 'cardRow' } as const, 0)
+const watching = atom({ plugin: 'agent-roster', key: 'watching' } as const, '')
 
 // The sprite's beat while anyone works, and how many beats between syncs with $.agent.list().
 const TICK_MS = 400
@@ -249,6 +254,38 @@ const toggle = async ($: EngineInterface) => {
   return 'Agents roster opened.'
 }
 
+// Its transcript in the main view; where the surface will not switch (the desktop app's tasks
+// list holds no such agent), a pane of the roster's own that reads its conversation instead.
+const openTranscript = async ($: EngineInterface, card: AgentCard) => {
+  const shown = await $.ui.view({ agentId: card.id })
+
+  if (!shown.deny) {
+    return
+  }
+
+  await update($, watching, () => card.id)
+  const name = card.name ?? card.type
+  const opened = await $.ui.open({ id: LOG, title: `${name} · progress`, focus: true, closeOnEscape: true })
+
+  if (!opened.isPlaced) {
+    $.ui.toast(shown.deny)
+  }
+}
+
+// One line of an agent's conversation: its words, or a tool call and how it went.
+const logLinesOf = (messages: readonly SessionMessage[]) =>
+  messages.slice(-LOG_MESSAGES).flatMap((message, i) => {
+    const words = message.text.replace(/\s+/g, ' ').trim()
+    const said = words ? [{ key: `m${i}`, text: `${message.role === 'user' ? '›' : '◆'} ${words.slice(0, 240)}`, dim: message.role === 'user' }] : []
+    const calls = message.toolUses.map(use => ({
+      key: use.tool_use_id,
+      text: `${use.isError ? '✗' : use.text === undefined ? '…' : '✓'} ${activityOf(use.tool, use.input)}`,
+      dim: true,
+    }))
+
+    return [...said, ...calls]
+  })
+
 // What every surface draws the roster from.
 const rosterOf = async ($: EngineInterface) => {
   const all = await read($, agents)
@@ -350,7 +387,7 @@ const drawTerminal = async ($: EngineInterface, elements: ElementTable<'terminal
                 </Text>
                 <Text dimColor>{fit(detailOf(card))}</Text>
                 {card.id !== MAIN ? (
-                  <Button key={`view-${card.id}`} plain dimColor label="↗ transcript" onPress={() => $.ui.view({ agentId: card.id })} />
+                  <Button key={`view-${card.id}`} plain dimColor label="↗ transcript" onPress={() => openTranscript($, card)} />
                 ) : (
                   <Text> </Text>
                 )}
@@ -369,7 +406,7 @@ const drawTerminal = async ($: EngineInterface, elements: ElementTable<'terminal
                 plain
                 dimColor
                 label={fitRow(historyLine(card))}
-                onPress={() => $.ui.view({ agentId: card.id })}
+                onPress={() => openTranscript($, card)}
               />
             ))}
         </Box>
@@ -396,6 +433,10 @@ export const register: Register = on => {
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE && e.origin.kind === 'person') {
       await hide($)
+    }
+
+    if (e.id === LOG) {
+      await update($, watching, () => '')
     }
 
     return next(e)
@@ -534,6 +575,51 @@ export const register: Register = on => {
     return {}
   })
 
+  // The progress pane: redrawn as the card it reads changes, a step or a tool call at a time.
+  on('ui.render', { component: 'Pane', requestId: LOG }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const id = await read($, watching)
+    const card = (await read($, agents))[id]
+    await read($, frame)
+    const found = id ? await $.session.messages({ agentId: id }) : { deny: 'No agent chosen.' }
+
+    if ('deny' in found) {
+      return <Text dimColor>{found.deny}</Text>
+    }
+
+    const badge = card ? BADGE[card.mood] : undefined
+    const lines = logLinesOf(found)
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {card && badge && (
+          <Text>
+            <Text color={badge.color}>
+              {badge.glyph} {badge.word}
+            </Text>
+            <Text dimColor>
+              {' '}
+              · {elapsed((card.endedAt ?? (await $.clock.now())) - card.startedAt)} · {card.steps} step
+              {card.steps === 1 ? '' : 's'}
+              {card.description ? ` · ${card.description}` : ''}
+            </Text>
+          </Text>
+        )}
+        <Box flexDirection="column">
+          {lines.length === 0 ? (
+            <Text dimColor>Nothing yet.</Text>
+          ) : (
+            lines.map(line => (
+              <Text key={line.key} dimColor={line.dim}>
+                {line.text}
+              </Text>
+            ))
+          )}
+        </Box>
+      </Box>
+    )
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { session, summary, live, history, isHistoryOpen, toggleHistory, historyLabel, historyLine, nameOf, clockOf, tokenLine, detailOf } =
       await rosterOf($)
@@ -582,7 +668,7 @@ export const register: Register = on => {
                   </Text>
                   {detailOf(card) && <Text dimColor>{detailOf(card)}</Text>}
                   {card.id !== MAIN && (
-                    <Button key={`view-${card.id}`} label="Open transcript" onPress={() => $.ui.view({ agentId: card.id })} />
+                    <Button key={`view-${card.id}`} label="Open transcript" onPress={() => openTranscript($, card)} />
                   )}
                 </Box>
               </Box>
@@ -598,7 +684,7 @@ export const register: Register = on => {
                     plain
                     dimColor
                     label={historyLine(card)}
-                    onPress={() => $.ui.view({ agentId: card.id })}
+                    onPress={() => openTranscript($, card)}
                   />
                 ))}
             </Box>

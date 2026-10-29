@@ -40,6 +40,8 @@ declare module 'claude-code' {
       bandShown: boolean
       // Which row of cards the band shows when they wrap past one.
       cardRow: number
+      // The agent the progress pane reads, '' while it is shut.
+      watching: string
     }
   }
 }

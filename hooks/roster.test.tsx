@@ -185,3 +185,30 @@ test('cards that overflow the band wrap into rows, one shown at a time', async (
   expect(await wide.find({ type: 'Text', text: /haiku/ })).toBeTruthy()
   await wide.unmount()
 })
+
+test('where the main view will not show an agent, its progress opens in a pane', async ($, on) => {
+  const { panes } = world(on)
+  on('ui.view', () => ({ value: { deny: 'The tasks list shows no a1.' } }))
+  on('session.messages', () => ({
+    value: [
+      { role: 'user', text: 'Find the auth code.', toolUses: [] },
+      {
+        role: 'assistant',
+        text: 'Looking.',
+        toolUses: [{ tool_use_id: 'u1', tool: 'Grep', input: { pattern: 'login' }, text: 'src/auth.ts' }],
+      },
+    ],
+  }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn(spawn)
+
+  const roster = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await roster.press({ key: 'view-a1' })
+  await roster.unmount()
+  expect(panes.has('agent-roster-log')).toBe(true)
+
+  const log = await $.ui.mount({ ...PANE, surface: 'desktop', requestId: 'agent-roster-log' })
+  expect(await log.find({ type: 'Text', text: /Grep login/ })).toBeTruthy()
+  expect(await log.find({ type: 'Text', text: /Looking/ })).toBeTruthy()
+  await log.unmount()
+})
